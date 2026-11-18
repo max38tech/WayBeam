@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#1E1B4B"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="96" y1="384" x2="416" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6366F1"/>
+      <stop offset="55%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#22D3EE"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="120" y1="140" x2="392" y2="340" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded squircle background -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bg)" stroke="#334155" stroke-width="6"/>
+
+  <!-- Outer display frame -->
+  <rect x="96" y="128" width="320" height="216" rx="28" fill="url(#screen)" stroke="url(#beam)" stroke-width="14"/>
+
+  <!-- Stand / base bar -->
+  <path d="M196 382H316" stroke="url(#beam)" stroke-width="16" stroke-linecap="round"/>
+
+  <!-- Signal / Beam waves inside display -->
+  <path d="M156 268C178 216 218 188 264 188" stroke="#6366F1" stroke-width="14" stroke-linecap="round" opacity="0.85"/>
+  <path d="M194 282C210 244 238 224 270 224" stroke="#38BDF8" stroke-width="14" stroke-linecap="round" opacity="0.95"/>
+
+  <!-- Stylized beam cursor / pointer -->
+  <path d="M274 180L354 242L312 254L296 296L274 180Z" fill="url(#beam)" stroke="#E0F2FE" stroke-width="6" stroke-linejoin="round"/>
+</svg>

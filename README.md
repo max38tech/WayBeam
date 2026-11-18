@@ -67,8 +67,10 @@ WayBeam/
 ├── firestore.rules               # Firestore security rules for room signaling
 ├── host-agent/
 │   ├── .env.example              # Host agent environment template
-│   ├── install_omarchy.sh        # Arch/Omarchy installer (packages, udev, input group)
+│   ├── install_omarchy.sh        # Arch/Omarchy installer (packages, udev, systemd, launchers)
 │   ├── requirements.txt          # Python dependencies (evdev, websockets, aiohttp, dotenv)
+│   ├── waybeam-ctl.sh            # Service/daemon & launcher control helper (waybeam-ctl)
+│   ├── waybeam.svg               # Vector application icon
 │   └── waybeam_agent.py          # Localhost WebSocket bridge & /dev/uinput injector
 └── web/
     ├── .env.example              # Firebase & local agent WebSocket config template
@@ -136,13 +138,19 @@ What `install_omarchy.sh` does:
 - Installs `python`, `python-evdev`, `python-websockets`, `python-aiohttp`, and `python-dotenv` via `pacman` (or falls back to a local `host-agent/.venv` if `--venv` is passed or `pacman` is unavailable).
 - Configures `/etc/udev/rules.d/99-waybeam-uinput.rules` and `/etc/modules-load.d/uinput.conf`, loads the `uinput` kernel module, and adds `$USER` to the `input` group.
 - Creates `host-agent/.env` from `host-agent/.env.example` if it does not already exist.
+- Installs the `waybeam-agent.service` systemd user unit, `waybeam.svg` icon, `~/.local/bin/waybeam-ctl` symlink, and Omarchy app launcher entries (`WayBeam Host` and `WayBeam Agent (Start / Stop)`).
 
 > **Important:** If you were newly added to the `input` group, **log out and log back in** (or run `newgrp input`) before starting the agent so `/dev/uinput` permissions take effect.
 
-Edit `host-agent/.env` with your Cloudflare TURN credentials (and optional `WAYBEAM_LOCAL_TOKEN` / `WAYBEAM_WS_PORT`), then start the agent:
+Edit `host-agent/.env` with your Cloudflare TURN credentials (and optional `WAYBEAM_LOCAL_TOKEN` / `WAYBEAM_WS_PORT`), then launch **WayBeam Host** directly from the Omarchy app launcher (`Super + Space`), or manage the daemon from the terminal:
 
 ```bash
-./host-agent/waybeam_agent.py
+waybeam-ctl start        # Start background agent (systemd user service)
+waybeam-ctl stop         # Stop background agent
+waybeam-ctl toggle       # Toggle agent on/off
+waybeam-ctl launch       # Start agent if needed and open Host Control Deck
+waybeam-ctl kill-switch  # Send SIGUSR1 to revoke remote control immediately
+waybeam-ctl status       # Check agent status
 ```
 
 ---
