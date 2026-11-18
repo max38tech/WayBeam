@@ -11,19 +11,29 @@ Runs a strictly localhost-bound WebSocket server that:
 from __future__ import annotations
 
 import asyncio
+import html
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import signal
 import sys
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 import websockets
 from dotenv import load_dotenv
+
+try:
+    from websockets.datastructures import Headers as WSHeaders
+    from websockets.http11 import Response as WSResponse
+except ImportError:
+    WSHeaders = None  # type: ignore[assignment,misc]
+    WSResponse = None  # type: ignore[assignment,misc]
 
 try:
     import evdev
@@ -48,6 +58,38 @@ PLACEHOLDER_VALUES = {
     "your_cloudflare_turn_key_id_here",
     "your_cloudflare_turn_api_token_here",
 }
+WEB_DIST_DIR = Path(__file__).resolve().parent.parent / "web" / "dist"
+STATIC_CONTENT_TYPES: dict[str, str] = {
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".wasm": "application/wasm",
+    ".txt": "text/plain; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+}
+
+
+def content_type_for_path(file_path: Path) -> str:
+    """Return an HTTP Content-Type header value for a static file path."""
+    suffix = file_path.suffix.lower()
+    if suffix in STATIC_CONTENT_TYPES:
+        return STATIC_CONTENT_TYPES[suffix]
+    guessed, _ = mimetypes.guess_type(str(file_path))
+    if not guessed:
+        return "application/octet-stream"
+    if guessed.startswith("text/") and "charset=" not in guessed:
+        return f"{guessed}; charset=utf-8"
+    return guessed
 
 
 def build_key_code_map() -> dict[str, int]:
@@ -632,6 +674,104 @@ class WayBeamHostAgent:
             self.clients.discard(websocket)
             self.input_mgr.release_all_inputs()
 
+    def _fallback_status_html(self) -> bytes:
+        page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WayBeam Host Agent</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 2rem; }}
+    main {{ max-width: 640px; margin: 2rem auto; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.5rem 2rem; }}
+    h1 {{ margin-top: 0; font-size: 1.35rem; }}
+    code {{ background: #0f172a; padding: 0.15rem 0.4rem; border-radius: 4px; color: #38bdf8; }}
+    pre {{ background: #0f172a; padding: 0.75rem 1rem; border-radius: 8px; overflow-x: auto; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>WayBeam Host Agent Running</h1>
+    <p>WebSocket endpoint: <code>ws://127.0.0.1:{self.port}</code></p>
+    <p>Status: <code>uinputReady={html.escape(str(self.uinput_ready).lower())}</code>, <code>controlEnabled={html.escape(str(self.control_enabled).lower())}</code></p>
+    <p>The built Web UI was not found at <code>{html.escape(str(WEB_DIST_DIR / "index.html"))}</code>.</p>
+    <p>Build or run the Web UI with:</p>
+    <pre>cd web &amp;&amp; npm run build
+# or for development:
+cd web &amp;&amp; npm run dev</pre>
+  </main>
+</body>
+</html>
+"""
+        return page.encode("utf-8")
+
+    def _resolve_http_response(self, raw_path: str) -> tuple[str, bytes]:
+        """Resolve an HTTP request path to (content_type, body) from web/dist."""
+        url_path = unquote(urlparse(raw_path).path or "/")
+        rel_path = url_path.lstrip("/")
+        dist_root = WEB_DIST_DIR.resolve()
+
+        if rel_path:
+            candidate = (dist_root / rel_path).resolve()
+            if candidate.is_relative_to(dist_root) and candidate.is_file():
+                return content_type_for_path(candidate), candidate.read_bytes()
+
+        index_file = dist_root / "index.html"
+        if index_file.is_file():
+            return "text/html; charset=utf-8", index_file.read_bytes()
+
+        return "text/html; charset=utf-8", self._fallback_status_html()
+
+    def process_http_request(self, arg1: Any, arg2: Any) -> Any:
+        """
+        Serve built Web UI static files on normal HTTP requests while letting
+        WebSocket upgrades proceed to handle_client.
+
+        Compatible with both websockets v13+ (connection, request) -> Response | None
+        and websockets v12 (path, request_headers) -> (HTTPStatus, headers, body) | None.
+        """
+        is_legacy_v12 = isinstance(arg1, str)
+        if is_legacy_v12:
+            raw_path = arg1 or "/"
+            headers = arg2
+            method = "GET"
+        else:
+            raw_path = getattr(arg2, "path", "/") or "/"
+            headers = getattr(arg2, "headers", {})
+            method = getattr(arg2, "method", "GET") or "GET"
+
+        upgrade = ""
+        if hasattr(headers, "get"):
+            upgrade = headers.get("Upgrade") or headers.get("upgrade") or ""
+        if str(upgrade).strip().lower() == "websocket":
+            return None
+
+        content_type, body = self._resolve_http_response(raw_path)
+        content_length = len(body)
+        if method.upper() == "HEAD":
+            body = b""
+
+        cache_control = (
+            "no-cache"
+            if content_type.startswith("text/html")
+            else "public, max-age=31536000, immutable"
+        )
+        header_pairs = [
+            ("Content-Type", content_type),
+            ("Content-Length", str(content_length)),
+            ("Cache-Control", cache_control),
+        ]
+
+        if not is_legacy_v12 and WSResponse is not None and WSHeaders is not None:
+            return WSResponse(
+                HTTPStatus.OK.value,
+                HTTPStatus.OK.phrase,
+                WSHeaders(header_pairs),
+                body,
+            )
+
+        return (HTTPStatus.OK, header_pairs, body)
+
     async def run(self) -> None:
         self._stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -648,9 +788,15 @@ class WayBeamHostAgent:
             except NotImplementedError:
                 pass
 
-        async with websockets.serve(self.handle_client, "127.0.0.1", self.port):
+        async with websockets.serve(
+            self.handle_client,
+            "127.0.0.1",
+            self.port,
+            process_request=self.process_http_request,
+        ):
             LOG.info(
-                "WayBeam Host Agent listening on ws://127.0.0.1:%d (uinputReady=%s, controlEnabled=%s)",
+                "WayBeam Host Agent listening on http://127.0.0.1:%d (Web UI + ws://127.0.0.1:%d, uinputReady=%s, controlEnabled=%s)",
+                self.port,
                 self.port,
                 self.uinput_ready,
                 self.control_enabled,
