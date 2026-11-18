@@ -1,0 +1,13 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /rooms/{roomCode} {
+      allow get, create, update, delete: if roomCode.matches('^[A-Z0-9-]{6,7}$');
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
