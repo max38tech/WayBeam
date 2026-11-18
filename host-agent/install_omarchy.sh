@@ -46,22 +46,29 @@ else
     fi
 fi
 
-echo "[WayBeam] Configuring udev rule for /dev/uinput..."
-UDEV_RULE='KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"'
-printf '%s\n' "$UDEV_RULE" | sudo tee /etc/udev/rules.d/99-waybeam-uinput.rules >/dev/null
-
-echo "[WayBeam] Reloading udev rules..."
-sudo udevadm control --reload-rules
-sudo udevadm trigger
+TARGET_USER="${SUDO_USER:-$USER}"
+if [ -n "$TARGET_USER" ]; then
+    echo "[WayBeam] Ensuring user '$TARGET_USER' is in the 'input' group..."
+    sudo usermod -aG input "$TARGET_USER"
+fi
 
 echo "[WayBeam] Loading uinput kernel module and persisting across reboots..."
 sudo modprobe uinput
 printf 'uinput\n' | sudo tee /etc/modules-load.d/uinput.conf >/dev/null
 
-TARGET_USER="${SUDO_USER:-$USER}"
-if [ -n "$TARGET_USER" ]; then
-    echo "[WayBeam] Ensuring user '$TARGET_USER' is in the 'input' group..."
-    sudo usermod -aG input "$TARGET_USER"
+echo "[WayBeam] Configuring udev rule for /dev/uinput..."
+UDEV_RULE='KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess", OPTIONS+="static_node=uinput"'
+printf '%s\n' "$UDEV_RULE" | sudo tee /etc/udev/rules.d/99-waybeam-uinput.rules >/dev/null
+
+echo "[WayBeam] Reloading udev rules..."
+sudo udevadm control --reload-rules
+sudo udevadm trigger --sysname-match=uinput
+
+echo "[WayBeam] Applying immediate /dev/uinput permissions for current session..."
+sudo chgrp input /dev/uinput || true
+sudo chmod 0660 /dev/uinput || true
+if command -v setfacl >/dev/null 2>&1 && [ -n "$TARGET_USER" ]; then
+    sudo setfacl -m "u:${TARGET_USER}:rw" /dev/uinput || true
 fi
 
 ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
