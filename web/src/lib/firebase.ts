@@ -207,6 +207,7 @@ export async function createRoom(
     roomCode: code,
     offer: null,
     answer: null,
+    viewerSessionId: null,
     hostCandidates: [],
     viewerCandidates: [],
     turnIceServers: null,
@@ -308,13 +309,21 @@ export async function writeOffer(
   if (!isFirebaseConfigured()) {
     const existing = readLocalRoom(code);
     if (!existing) return;
-    writeLocalRoom(code, { ...existing, offer: payload, updatedAt: Date.now() });
+    writeLocalRoom(code, {
+      ...existing,
+      offer: payload,
+      answer: null,
+      viewerCandidates: [],
+      updatedAt: Date.now(),
+    });
     return;
   }
 
   const db = getDb();
   await updateDoc(doc(db, 'rooms', code), {
     offer: payload,
+    answer: null,
+    viewerCandidates: [],
     updatedAt: Date.now(),
   });
 }
@@ -322,6 +331,7 @@ export async function writeOffer(
 export async function writeAnswer(
   roomCode: string,
   answer: RTCSessionDescriptionInit,
+  viewerSessionId?: string,
 ): Promise<void> {
   const code = normalizeRoomCode(roomCode);
   const payload = serializeDescription(answer, 'answer');
@@ -329,13 +339,46 @@ export async function writeAnswer(
   if (!isFirebaseConfigured()) {
     const existing = readLocalRoom(code);
     if (!existing) return;
-    writeLocalRoom(code, { ...existing, answer: payload, updatedAt: Date.now() });
+    writeLocalRoom(code, {
+      ...existing,
+      answer: payload,
+      ...(viewerSessionId !== undefined ? { viewerSessionId } : {}),
+      updatedAt: Date.now(),
+    });
+    return;
+  }
+
+  const db = getDb();
+  const update: Record<string, unknown> = {
+    answer: payload,
+    updatedAt: Date.now(),
+  };
+  if (viewerSessionId !== undefined) {
+    update.viewerSessionId = viewerSessionId;
+  }
+  await updateDoc(doc(db, 'rooms', code), update);
+}
+
+export async function requestViewerReconnect(
+  roomCode: string,
+  viewerSessionId: string,
+): Promise<void> {
+  const code = normalizeRoomCode(roomCode);
+
+  if (!isFirebaseConfigured()) {
+    const existing = readLocalRoom(code);
+    if (!existing) return;
+    writeLocalRoom(code, {
+      ...existing,
+      viewerSessionId,
+      updatedAt: Date.now(),
+    });
     return;
   }
 
   const db = getDb();
   await updateDoc(doc(db, 'rooms', code), {
-    answer: payload,
+    viewerSessionId,
     updatedAt: Date.now(),
   });
 }

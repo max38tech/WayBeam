@@ -5,6 +5,7 @@ import {
   deleteRoom,
   getRoom,
   normalizeRoomCode,
+  requestViewerReconnect,
   subscribeToRoom,
   updateControlState,
   writeAnswer,
@@ -303,6 +304,9 @@ export class WebRTCManager {
   private processedRemoteCandidates = 0;
   private pendingRemoteCandidates: IceCandidatePayload[] = [];
   private makingOffer = false;
+  private updateQueue: Promise<void> = Promise.resolve();
+  private viewerSessionId: string;
+  private activeViewerSessionId: string | null = null;
 
   private prevBytes = 0;
   private prevBytesTimestamp = 0;
@@ -316,13 +320,41 @@ export class WebRTCManager {
     this.onControlPacket = options.onControlPacket;
     this.onRoomUpdate = options.onRoomUpdate;
     this.onError = options.onError;
+    this.viewerSessionId =
+      typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
-  private createPeerConnection(): RTCPeerConnection {
+  private enqueueRoomUpdate(fn: () => Promise<void>): void {
+    this.updateQueue = this.updateQueue
+      .then(async () => {
+        if (this.destroyed) return;
+        await fn();
+      })
+      .catch((err) => {
+        if (!this.destroyed) {
+          this.onError?.(err instanceof Error ? err.message : String(err));
+        }
+      });
+  }
+
+  private createPeerConnection(): RTCPeerConnection | null {
+    if (this.destroyed) return null;
+
     const pc = new RTCPeerConnection({
       iceServers: DEFAULT_STUN_SERVERS,
       iceTransportPolicy: 'all',
     });
+
+    if (this.destroyed) {
+      try {
+        pc.close();
+      } catch {
+        // Ignore close errors
+      }
+      return null;
+    }
 
     pc.onicecandidate = (event) => {
       if (!event.candidate || this.destroyed) return;
@@ -339,9 +371,14 @@ export class WebRTCManager {
     };
 
     pc.oniceconnectionstatechange = () => {
+      if (this.destroyed) return;
       const state = pc.iceConnectionState;
       if (state === 'connected' || state === 'completed') {
         this.clearTurnFallbackTimer();
+      } else if (state === 'checking') {
+        if (this.role === 'host' && !this.turnFallbackTriggered && !this.turnFallbackTimer) {
+          this.startTurnFallbackTimer();
+        }
       } else if (state === 'failed' || state === 'disconnected') {
         if (this.role === 'host' && !this.turnFallbackTriggered) {
           void this.triggerTurnFallback();
@@ -408,10 +445,13 @@ export class WebRTCManager {
   }
 
   async startHost(stream: MediaStream, preset: QualityPreset = 'balanced'): Promise<void> {
+    if (this.destroyed) return;
     this.currentPreset = preset;
     await createRoom(this.roomCode, preset);
+    if (this.destroyed) return;
 
     const pc = this.createPeerConnection();
+    if (!pc || this.destroyed) return;
     const channel = pc.createDataChannel('waybeam-control', { ordered: true });
     this.attachDataChannel(channel);
 
@@ -420,33 +460,63 @@ export class WebRTCManager {
     }
 
     await this.applyQualityPreset(preset);
+    if (this.destroyed) return;
 
     this.makingOffer = true;
     try {
       const offer = await pc.createOffer();
+      if (this.destroyed) return;
       await pc.setLocalDescription(offer);
+      if (this.destroyed) return;
       this.lastOfferUpdatedAt = Date.now();
       await writeOffer(this.roomCode, offer);
+      if (this.destroyed) return;
     } finally {
       this.makingOffer = false;
     }
 
-    this.startTurnFallbackTimer();
-
     this.unsubscribeRoom = subscribeToRoom(
       this.roomCode,
       (room) => {
+        if (this.destroyed) return;
         this.onRoomUpdate?.(room);
-        if (!room || this.destroyed) return;
-        void this.handleHostRoomUpdate(room);
+        if (!room) return;
+        this.enqueueRoomUpdate(() => this.handleHostRoomUpdate(room));
       },
       (err) => {
-        this.onError?.(err.message);
+        if (!this.destroyed) {
+          this.onError?.(err.message);
+        }
       },
     );
   }
 
+  private async renegotiateOffer(newViewerSessionId?: string): Promise<void> {
+    if (this.destroyed || this.makingOffer || this.role !== 'host') return;
+    const pc = this.pc;
+    if (!pc) return;
+
+    if (newViewerSessionId) {
+      this.activeViewerSessionId = newViewerSessionId;
+    }
+    this.makingOffer = true;
+    try {
+      const offer = await pc.createOffer({ iceRestart: true });
+      if (this.destroyed) return;
+      await pc.setLocalDescription(offer);
+      if (this.destroyed) return;
+      this.lastOfferUpdatedAt = Date.now();
+      this.processedRemoteCandidates = 0;
+      this.pendingRemoteCandidates = [];
+      await writeOffer(this.roomCode, offer);
+      if (this.destroyed) return;
+    } finally {
+      this.makingOffer = false;
+    }
+  }
+
   private async handleHostRoomUpdate(room: RoomDocument): Promise<void> {
+    if (this.destroyed) return;
     const pc = this.pc;
     if (!pc) return;
 
@@ -455,47 +525,94 @@ export class WebRTCManager {
       this.localAgent?.setControl(room.controlGranted);
     }
 
+    if (
+      room.viewerSessionId &&
+      this.activeViewerSessionId !== null &&
+      room.viewerSessionId !== this.activeViewerSessionId &&
+      !this.makingOffer
+    ) {
+      await this.renegotiateOffer(room.viewerSessionId);
+      return;
+    }
+
     if (room.answer && room.answer.updatedAt > this.lastAnswerUpdatedAt) {
+      if (pc.signalingState !== 'have-local-offer') {
+        if (
+          room.viewerSessionId &&
+          room.viewerSessionId !== this.activeViewerSessionId &&
+          !this.makingOffer
+        ) {
+          await this.renegotiateOffer(room.viewerSessionId);
+        }
+        return;
+      }
+
       this.lastAnswerUpdatedAt = room.answer.updatedAt;
+      if (room.viewerSessionId) {
+        this.activeViewerSessionId = room.viewerSessionId;
+      }
       try {
         await pc.setRemoteDescription(
           new RTCSessionDescription({ type: room.answer.type, sdp: room.answer.sdp }),
         );
+        if (this.destroyed) return;
         await this.flushPendingCandidates();
+        if (this.destroyed) return;
+        this.startTurnFallbackTimer();
       } catch (err) {
-        this.onError?.(`Failed to apply viewer answer: ${String(err)}`);
+        if (!this.destroyed) {
+          this.onError?.(`Failed to apply viewer answer: ${String(err)}`);
+        }
       }
     }
 
+    if (this.destroyed) return;
+    if (room.viewerCandidates.length < this.processedRemoteCandidates) {
+      this.processedRemoteCandidates = 0;
+    }
     if (room.viewerCandidates.length > this.processedRemoteCandidates) {
       const fresh = room.viewerCandidates.slice(this.processedRemoteCandidates);
       this.processedRemoteCandidates = room.viewerCandidates.length;
       await this.addRemoteCandidates(fresh);
+      if (this.destroyed) return;
     }
   }
 
   async startViewer(): Promise<void> {
+    if (this.destroyed) return;
     const existing = await getRoom(this.roomCode);
+    if (this.destroyed) return;
     if (!existing) {
       throw new Error(`Room ${this.roomCode} not found`);
     }
 
-    this.createPeerConnection();
+    if (existing.answer !== null) {
+      this.lastOfferUpdatedAt = existing.offer?.updatedAt ?? 0;
+      await requestViewerReconnect(this.roomCode, this.viewerSessionId);
+      if (this.destroyed) return;
+    }
+
+    const pc = this.createPeerConnection();
+    if (!pc || this.destroyed) return;
 
     this.unsubscribeRoom = subscribeToRoom(
       this.roomCode,
       (room) => {
+        if (this.destroyed) return;
         this.onRoomUpdate?.(room);
-        if (!room || this.destroyed) return;
-        void this.handleViewerRoomUpdate(room);
+        if (!room) return;
+        this.enqueueRoomUpdate(() => this.handleViewerRoomUpdate(room));
       },
       (err) => {
-        this.onError?.(err.message);
+        if (!this.destroyed) {
+          this.onError?.(err.message);
+        }
       },
     );
   }
 
   private async handleViewerRoomUpdate(room: RoomDocument): Promise<void> {
+    if (this.destroyed) return;
     const pc = this.pc;
     if (!pc) return;
 
@@ -519,19 +636,28 @@ export class WebRTCManager {
         await pc.setRemoteDescription(
           new RTCSessionDescription({ type: room.offer.type, sdp: room.offer.sdp }),
         );
+        if (this.destroyed) return;
         await this.flushPendingCandidates();
+        if (this.destroyed) return;
         const answer = await pc.createAnswer();
+        if (this.destroyed) return;
         await pc.setLocalDescription(answer);
-        await writeAnswer(this.roomCode, answer);
+        if (this.destroyed) return;
+        await writeAnswer(this.roomCode, answer, this.viewerSessionId);
+        if (this.destroyed) return;
       } catch (err) {
-        this.onError?.(`Failed to process host offer: ${String(err)}`);
+        if (!this.destroyed) {
+          this.onError?.(`Failed to process host offer: ${String(err)}`);
+        }
       }
     }
 
+    if (this.destroyed) return;
     if (room.hostCandidates.length > this.processedRemoteCandidates) {
       const fresh = room.hostCandidates.slice(this.processedRemoteCandidates);
       this.processedRemoteCandidates = room.hostCandidates.length;
       await this.addRemoteCandidates(fresh);
+      if (this.destroyed) return;
     }
   }
 
@@ -594,6 +720,7 @@ export class WebRTCManager {
       if (this.destroyed || turnServers.length === 0) return;
 
       await writeTurnIceServers(this.roomCode, turnServers);
+      if (this.destroyed) return;
       pc.setConfiguration({
         iceServers: [...DEFAULT_STUN_SERVERS, ...turnServers],
         iceTransportPolicy: 'all',
@@ -602,14 +729,21 @@ export class WebRTCManager {
       this.makingOffer = true;
       try {
         const offer = await pc.createOffer({ iceRestart: true });
+        if (this.destroyed) return;
         await pc.setLocalDescription(offer);
+        if (this.destroyed) return;
         this.lastOfferUpdatedAt = Date.now();
+        this.processedRemoteCandidates = 0;
+        this.pendingRemoteCandidates = [];
         await writeOffer(this.roomCode, offer);
+        if (this.destroyed) return;
       } finally {
         this.makingOffer = false;
       }
     } catch (err) {
-      this.onError?.(`TURN fallback failed: ${String(err)}`);
+      if (!this.destroyed) {
+        this.onError?.(`TURN fallback failed: ${String(err)}`);
+      }
     }
   }
 

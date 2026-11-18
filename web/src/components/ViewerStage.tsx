@@ -55,6 +55,7 @@ export function ViewerStage({
 
   const stageRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
   const webrtcRef = useRef<WebRTCManager | null>(null);
   const controlActiveRef = useRef(false);
   const hideTimerRef = useRef<number | null>(null);
@@ -74,6 +75,7 @@ export function ViewerStage({
       role: 'viewer',
       roomCode: normalizedCode,
       onRemoteStream: (stream) => {
+        remoteStreamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.play().catch(() => {});
@@ -105,9 +107,21 @@ export function ViewerStage({
     });
 
     return () => {
+      webrtcRef.current = null;
+      remoteStreamRef.current = null;
       manager.destroy().catch(() => {});
     };
   }, [normalizedCode]);
+
+  // Ensure video element always receives the latest remote stream if it mounts/updates
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    const stream = remoteStreamRef.current;
+    if (videoEl && stream && videoEl.srcObject !== stream) {
+      videoEl.srcObject = stream;
+      videoEl.play().catch(() => {});
+    }
+  }, [streamReady]);
 
   // Attach input bridge to video element
   useEffect(() => {
@@ -350,7 +364,7 @@ export function ViewerStage({
         </div>
       )}
 
-      <video ref={videoRef} className="wb-viewer-video" autoPlay playsInline />
+      <video ref={videoRef} className="wb-viewer-video" autoPlay playsInline muted />
 
       {/* Waiting / Error Overlay */}
       {!streamReady && (

@@ -39,6 +39,7 @@ export interface RoomDocument {
   roomCode: string;
   offer: SessionDescriptionPayload | null;
   answer: SessionDescriptionPayload | null;
+  viewerSessionId?: string | null;
   hostCandidates: IceCandidatePayload[];
   viewerCandidates: IceCandidatePayload[];
   turnIceServers: IceServerConfig[] | null;
